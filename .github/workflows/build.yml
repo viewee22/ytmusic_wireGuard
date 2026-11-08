@@ -1,0 +1,124 @@
+name: Build WireGuard patches
+
+on:
+  workflow_dispatch:
+    inputs:
+      morphe_ref:
+        description: "Morphe patches version (git tag) to build on"
+        default: "v2.1.0"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    env:
+      MORPHE_REF: ${{ inputs.morphe_ref || 'v2.1.0' }}
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+
+      - name: Checkout Morphe patches
+        uses: actions/checkout@v4
+        with:
+          repository: MorpheApp/morphe-patches
+          ref: ${{ env.MORPHE_REF }}
+          path: morphe-patches
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Test WireGuard engine
+        working-directory: overlay/wireguard-proxy
+        run: |
+          go mod tidy
+          go test -count=1 -v ./...
+
+      - name: Build WireGuard engine for Android
+        working-directory: overlay/wireguard-proxy
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "Using NDK: $NDK"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          OUT="$GITHUB_WORKSPACE/morphe-patches/patches/src/main/resources/wireguard"
+
+          build() {
+            local abi=$1 goarch=$2 cc=$3
+            mkdir -p "$OUT/$abi"
+            env CGO_ENABLED=1 GOOS=android GOARCH="$goarch" GOARM=7 CC="$TOOLCHAIN/$cc" \
+              go build -buildmode=c-shared -trimpath \
+              -ldflags="-s -w -buildid= -extldflags=-Wl,-z,max-page-size=16384" \
+              -o "$OUT/$abi/libwgproxy.so" .
+            rm -f "$OUT/$abi/libwgproxy.h"
+          }
+
+          build arm64-v8a   arm64 aarch64-linux-android26-clang
+          build armeabi-v7a arm   armv7a-linux-androideabi26-clang
+          build x86_64      amd64 x86_64-linux-android26-clang
+
+          ls -la "$OUT"/*
+
+      - name: Add WireGuard patch to Morphe patches
+        run: python3 overlay/scripts/apply_overlay.py overlay morphe-patches
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Build patches
+        working-directory: morphe-patches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x gradlew
+          ./gradlew :patches:buildAndroid --no-daemon
+          ls -la patches/build/libs
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: patches-wireguard
+          path: morphe-patches/patches/build/libs/*.mpp
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MPP=$(ls morphe-patches/patches/build/libs/*.mpp | head -n 1)
+          VERSION="${MORPHE_REF#v}-wg.${GITHUB_RUN_NUMBER}"
+          TAG="v${VERSION}"
+          ASSET="patches-${VERSION}.mpp"
+          cp "$MPP" "$ASSET"
+
+          cat > patches-bundle.json <<EOF
+          {
+            "created_at": "$(date -u +%Y-%m-%dT%H:%M:%S)",
+            "description": "Morphe patches ${MORPHE_REF} + WireGuard VPN",
+            "download_url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ASSET}",
+            "signature_download_url": "",
+            "version": "${VERSION}"
+          }
+          EOF
+
+          gh release create "$TAG" "$ASSET" patches-bundle.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Morphe ${MORPHE_REF} + WireGuard VPN (${GITHUB_RUN_NUMBER})" \
+            --notes "Morphe patches ${MORPHE_REF} with the WireGuard VPN patch for YouTube Music."
